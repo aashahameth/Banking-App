@@ -1,13 +1,17 @@
 import datetime
-# import random # Not used, so let's remove it for cleaner imports
-import json
+import json # Still needed for transactions list within accounts.txt
 import os
 import hashlib
 import getpass
 import re # For basic validation (e.g., DOB)
 
 # --- Configuration ---
-DATA_FILE = "banking_data.json" # JSON file to store all our data
+USERS_FILE = "users.txt"
+ACCOUNTS_FILE = "accounts.txt"
+NEXT_ACC_NUM_FILE = "next_account_number.txt"
+DATA_DELIMITER = "|~|" # Delimiter for fields in a line
+LIST_DELIMITER = ";"   # Delimiter for items in a list (e.g., owned_accounts)
+
 INTEREST_RATE = 0.015 # Annual interest rate (1.5%)
 MIN_INITIAL_DEPOSIT = 0.0 # Minimum deposit for new accounts
 
@@ -32,7 +36,7 @@ next_account_number = 1001
 def generate_account_number():
     """Generates a new, unique bank account number."""
     global next_account_number
-    # Ensure the generated number isn't already in use (e.g., from manual data edit)
+    # Ensure the generated number isn't already in use
     while str(next_account_number) in accounts:
         next_account_number += 1
     acc_num = str(next_account_number)
@@ -53,7 +57,7 @@ def get_timestamp():
 
 def format_currency(amount):
     """Formats a number as currency (e.g., $1,234.50)."""
-    return f"${amount:,.2f}" # Standard currency format
+    return f"${amount:,.2f}"
 
 def is_valid_dob(date_str):
     """Checks if a date string is in YYYY-MM-DD format using regex."""
@@ -62,7 +66,6 @@ def is_valid_dob(date_str):
 def record_transaction(acc_num, trans_type, amount, **details):
     """Adds a transaction record to an account's history."""
     if acc_num not in accounts:
-        # This should ideally not happen if account management is correct
         print(f"Error: Attempted to record transaction for non-existent account {acc_num}.")
         return
 
@@ -70,96 +73,256 @@ def record_transaction(acc_num, trans_type, amount, **details):
         "timestamp": get_timestamp(),
         "type": trans_type,
         "amount": amount,
-        **details # For extra info like 'to_account' or 'from_account'
+        **details
     }
-    # Ensure the transactions list exists before appending
     accounts[acc_num].setdefault("transactions", []).append(transaction)
 
 # --- Data Persistence ---
 
-def save_data():
-    """Saves users, accounts, and next_account_number to the JSON file."""
-    global users, accounts, next_account_number # Explicitly state globals being modified
-    data_to_save = {
-        "users": users,
-        "accounts": accounts,
-        "next_account_number": next_account_number
+def _serialize_user(nic, user_data):
+    """Converts user data dictionary to a delimited string for TXT file."""
+    # Ensure owned_accounts is a list and handle missing key gracefully
+    owned_accounts_list = user_data.get("owned_accounts", []) if user_data.get("role") == "customer" else []
+    owned_accounts_str = LIST_DELIMITER.join(owned_accounts_list)
+    
+    return DATA_DELIMITER.join([
+        str(nic),
+        str(user_data.get("name", "")),
+        str(user_data.get("address", "")),
+        str(user_data.get("dob", "")),
+        str(user_data.get("password_hash", "")),
+        str(user_data.get("role", "")),
+        owned_accounts_str # This will be empty string if owned_accounts_list is empty
+    ])
+
+def _deserialize_user(line):
+    """Converts a delimited string from TXT file back to user data (nic, dict)."""
+    parts = line.strip().split(DATA_DELIMITER)
+    if len(parts) != 7: # Expecting exactly 7 parts
+        # print(f"Debug: Malformed user line (expected 7 parts, got {len(parts)}): {line.strip()}")
+        return None, None
+    
+    nic = parts[0]
+    role = parts[5]
+    owned_accounts_part = parts[6]
+
+    user_data = {
+        "name": parts[1],
+        "address": parts[2],
+        "dob": parts[3],
+        "password_hash": parts[4],
+        "role": role
     }
+    if role == 'customer':
+        # Handles empty string for owned_accounts_part correctly (results in empty list)
+        user_data["owned_accounts"] = [acc for acc in owned_accounts_part.split(LIST_DELIMITER) if acc]
+    elif role == 'admin':
+        # Admins don't have owned_accounts; if data exists, it's unexpected but ignored.
+        if owned_accounts_part:
+            # print(f"Warning: Admin user {nic} has unexpected data in owned_accounts field: '{owned_accounts_part}'. Ignoring.")
+            pass 
+    else: # Invalid role
+        # print(f"Warning: Invalid role '{role}' for user {nic} in line: {line.strip()}")
+        return None, None
+
+    return nic, user_data
+
+
+def _serialize_account(acc_num, acc_data):
+    """Converts account data dictionary to a delimited string for TXT file."""
+    # Transactions list is complex, so serialize it as a JSON string within the line
+    transactions_json_str = json.dumps(acc_data.get("transactions", []))
+    return DATA_DELIMITER.join([
+        str(acc_num),
+        str(acc_data.get("owner_nic", "")),
+        str(float(acc_data.get("balance", 0.0))), # Ensure balance is float then string
+        str(acc_data.get("created_at", "")),
+        transactions_json_str
+    ])
+
+def _deserialize_account(line):
+    """Converts a delimited string from TXT file back to account data (acc_num, dict)."""
+    parts = line.strip().split(DATA_DELIMITER)
+    if len(parts) != 5: # Expecting exactly 5 parts
+        # print(f"Debug: Malformed account line (expected 5 parts, got {len(parts)}): {line.strip()}")
+        return None, None
+    
+    acc_num = parts[0]
+    balance_str = parts[2]
+    transactions_json_str = parts[4]
+
     try:
-        with open(DATA_FILE, 'w') as f:
-            json.dump(data_to_save, f, indent=4)
-        # print("Debug: Data saved successfully.") # Optional: for debugging
+        balance = float(balance_str)
+    except ValueError:
+        # print(f"Warning: Invalid balance format for account {acc_num}: '{balance_str}'. Defaulting to 0.0.")
+        balance = 0.0 
+
+    try:
+        transactions_list = json.loads(transactions_json_str)
+        if not isinstance(transactions_list, list): # Ensure it's a list
+            # print(f"Warning: Transactions data for account {acc_num} is not a list. Defaulting to empty. Data: {transactions_json_str[:50]}")
+            transactions_list = []
+    except json.JSONDecodeError:
+        # print(f"Warning: Could not parse transactions JSON for account {acc_num}. Defaulting to empty list. Data: {transactions_json_str[:50]}")
+        transactions_list = []
+
+    acc_data = {
+        "owner_nic": parts[1],
+        "balance": balance,
+        "created_at": parts[3],
+        "transactions": transactions_list
+    }
+    return acc_num, acc_data
+
+def save_data():
+    """Saves users, accounts, and next_account_number to their respective TXT files."""
+    global users, accounts, next_account_number
+
+    # Save Users
+    try:
+        with open(USERS_FILE, 'w') as f:
+            for nic, user_data in users.items():
+                f.write(_serialize_user(nic, user_data) + "\n")
     except IOError as e:
-        print(f"\nError: Could not save data to {DATA_FILE}! Changes might be lost. Details: {e}")
+        print(f"\nError: Could not save user data to {USERS_FILE}! Changes might be lost. Details: {e}")
     except Exception as e:
-         print(f"\nError: An unexpected error occurred while saving data: {e}")
+        print(f"\nError: An unexpected error occurred while saving user data: {e}")
+
+    # Save Accounts
+    try:
+        with open(ACCOUNTS_FILE, 'w') as f:
+            for acc_num, acc_data in accounts.items():
+                f.write(_serialize_account(acc_num, acc_data) + "\n")
+    except IOError as e:
+        print(f"\nError: Could not save account data to {ACCOUNTS_FILE}! Changes might be lost. Details: {e}")
+    except Exception as e:
+        print(f"\nError: An unexpected error occurred while saving account data: {e}")
+
+    # Save Next Account Number
+    try:
+        with open(NEXT_ACC_NUM_FILE, 'w') as f:
+            f.write(str(next_account_number))
+    except IOError as e:
+        print(f"\nError: Could not save next account number to {NEXT_ACC_NUM_FILE}! Details: {e}")
+    except Exception as e:
+        print(f"\nError: An unexpected error occurred while saving next account number: {e}")
 
 def load_data():
-    """Loads data from the JSON file when the application starts.
-    Initializes first admin if no data/users exist."""
+    """Loads data from TXT files. Initializes first admin if no data/users exist."""
     global users, accounts, next_account_number
+    users = {} 
+    accounts = {}
+    next_account_number = 1001 
 
-    if not os.path.exists(DATA_FILE):
-        print(f"Welcome! Data file ({DATA_FILE}) not found. This might be the first run.")
-        # No users means we need an admin
-        if not users: # This will always be true if file doesn't exist and users is empty
-             print("Setting up the first Admin account...")
-             if not create_first_admin():
-                 print("Admin setup failed. The application cannot continue without an admin. Exiting.")
-                 exit()
-             save_data() # Save the newly created admin
-             print("Initial Admin user created and saved.")
-        return
+    any_file_issue = False # Tracks if any file is missing or has issues
 
-    print(f"Loading data from {DATA_FILE}...")
-    try:
-        with open(DATA_FILE, 'r') as f:
-            data = json.load(f)
-            users = data.get("users", {})
-            accounts = data.get("accounts", {})
-            next_account_number = data.get("next_account_number", 1001)
+    # Load Users
+    if os.path.exists(USERS_FILE):
+        try:
+            with open(USERS_FILE, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    line_content = line.strip()
+                    if not line_content: continue # Skip empty lines
+                    nic, user_data = _deserialize_user(line_content)
+                    if nic and user_data:
+                        users[nic] = user_data
+                    else:
+                        print(f"Warning: Skipping malformed user data on line {line_num} in {USERS_FILE}.")
+            print(f"Loaded {len(users)} users from {USERS_FILE}.")
+        except IOError as e:
+            print(f"Warning: Could not read users file {USERS_FILE}. Error: {e}.")
+            any_file_issue = True 
+        except Exception as e: # Catch-all for other unexpected parsing issues
+            print(f"Warning: An unexpected error occurred loading users from {USERS_FILE}: {e}.")
+            any_file_issue = True 
+    else:
+        print(f"User data file ({USERS_FILE}) not found.")
+        any_file_issue = True
 
-            # Data integrity checks / minor migrations for older formats
-            for user_data in users.values(): # No need for nic here
-                if user_data.get('role') == 'customer':
-                    user_data.setdefault('owned_accounts', [])
-            for acc_data in accounts.values():
-                 acc_data.setdefault("transactions", [])
-                 # Could add other checks here, e.g., ensuring 'owner_nic' exists
+    # Load Accounts
+    if os.path.exists(ACCOUNTS_FILE):
+        try:
+            with open(ACCOUNTS_FILE, 'r') as f:
+                for line_num, line in enumerate(f, 1):
+                    line_content = line.strip()
+                    if not line_content: continue
+                    acc_num, acc_data = _deserialize_account(line_content)
+                    if acc_num and acc_data:
+                        accounts[acc_num] = acc_data
+                    else:
+                         print(f"Warning: Skipping malformed account data on line {line_num} in {ACCOUNTS_FILE}.")
+            print(f"Loaded {len(accounts)} accounts from {ACCOUNTS_FILE}.")
+        except IOError as e:
+            print(f"Warning: Could not read accounts file {ACCOUNTS_FILE}. Error: {e}.")
+            any_file_issue = True
+        except Exception as e:
+            print(f"Warning: An unexpected error occurred loading accounts from {ACCOUNTS_FILE}: {e}.")
+            any_file_issue = True
+    else:
+        print(f"Account data file ({ACCOUNTS_FILE}) not found.")
+        if not any_file_issue : any_file_issue = True # Mark issue if users file existed but this one doesn't
 
-            print("Data loaded successfully.")
-
-            # If data file was empty or users part was missing/empty
-            if not users:
-                 print("Loaded data, but no users found. Let's set up the first Admin account.")
-                 if not create_first_admin():
-                     print("Admin setup failed. Exiting.")
-                     exit()
-                 save_data()
-                 print("Initial Admin user created and saved.")
-
-    except json.JSONDecodeError:
-        print(f"Warning: Could not parse data in {DATA_FILE}. It might be corrupted. Starting fresh.")
+    # Load Next Account Number
+    if os.path.exists(NEXT_ACC_NUM_FILE):
+        try:
+            with open(NEXT_ACC_NUM_FILE, 'r') as f:
+                content = f.read().strip()
+                if content.isdigit():
+                    next_account_number = int(content)
+                    print(f"Loaded next account number: {next_account_number} from {NEXT_ACC_NUM_FILE}.")
+                else:
+                    print(f"Warning: Invalid content in {NEXT_ACC_NUM_FILE} ('{content}'). Using default {next_account_number}.")
+                    if not any_file_issue : any_file_issue = True 
+        except IOError as e:
+            print(f"Warning: Could not read {NEXT_ACC_NUM_FILE}. Error: {e}. Using default {next_account_number}.")
+            if not any_file_issue : any_file_issue = True
+        except Exception as e:
+            print(f"Warning: An unexpected error occurred loading {NEXT_ACC_NUM_FILE}: {e}. Using default {next_account_number}.")
+            if not any_file_issue : any_file_issue = True
+    else:
+        print(f"Next account number file ({NEXT_ACC_NUM_FILE}) not found. Using default {next_account_number}.")
+        if not any_file_issue : any_file_issue = True
+    
+    # Post-load checks and initialization logic
+    if not users : # If no users were loaded (files missing, empty, all corrupt, or first run)
+        if any_file_issue : # Typically indicates first run or major data loss
+            print(f"Welcome! Some data files were missing or unreadable. This may be the first run or data is incomplete.")
+        else: # All files might have existed, but users.txt was empty or all lines were corrupt.
+            print(f"Data files found, but no valid user data loaded.")
         _initialize_fresh_start_with_admin()
-    except IOError as e:
-        print(f"Warning: Could not read data file {DATA_FILE}. Error: {e}. Starting fresh.")
-        _initialize_fresh_start_with_admin()
-    except Exception as e: # Catch-all for other unexpected loading errors
-        print(f"Warning: An unexpected error occurred loading data: {e}. Starting fresh.")
-        _initialize_fresh_start_with_admin()
+    else:
+        # Perform basic data integrity checks if users were loaded
+        for user_data_val in users.values(): # No need for nic here
+            if user_data_val.get('role') == 'customer':
+                user_data_val.setdefault('owned_accounts', []) 
+        for acc_data_val in accounts.values():
+             acc_data_val.setdefault("transactions", [])
+        
+        # Check if at least one admin exists
+        has_admin = any(u.get('role') == 'admin' for u in users.values())
+        if not has_admin:
+            print("CRITICAL WARNING: Loaded user data, but NO admin user found!")
+            print("The system may not function correctly. An admin is required for some operations.")
+            print("Consider registering an admin or resetting data if issues persist.")
+            # Depending on policy, could force admin creation or exit.
+            # For now, allows app to continue with this warning.
+        print("Data loading process complete.")
+
 
 def _initialize_fresh_start_with_admin():
-    """Helper to reset data and create the first admin if loading fails badly."""
+    """Helper to reset data and create the first admin if loading fails badly or for a fresh start."""
     global users, accounts, next_account_number
+    print("\nInitializing fresh start: Resetting data stores.")
     users = {}
     accounts = {}
     next_account_number = 1001
-    print("Attempting to set up a new Admin account...")
-    if not create_first_admin():
-        print("Critical: Admin setup failed during fresh start. Exiting.")
+    print("Attempting to set up a new Admin account for the fresh start...")
+    if not create_first_admin(): # create_first_admin internally calls register_user
+        print("Critical: Admin setup failed during fresh start. The application cannot continue without an admin. Exiting.")
         exit()
-    save_data()
-    print("Initial Admin user created for fresh start.")
+    # create_first_admin modified global `users`. Now save everything.
+    save_data() # This will create the .txt files with the new admin and empty accounts/next_num.
+    print("Initial Admin user created and all data files initialized/updated for fresh start.")
 
 
 # --- User Management & Authentication ---
@@ -168,7 +331,7 @@ def create_first_admin():
     """Guides the creation of the very first admin user. Called during setup."""
     print("\n--- Initial Admin User Setup ---")
     print("The system requires an administrator to be set up.")
-    return register_user(role='admin') # Re-use the general registration logic
+    return register_user(role='admin') 
 
 def register_user(role='customer'):
     """Handles registration for a new user (admin or customer)."""
@@ -180,14 +343,21 @@ def register_user(role='customer'):
             continue
         if nic in users:
             print(f"Error: A user with NIC '{nic}' already exists. Registration failed.")
-            return False # Indicate failure to calling function
-        break # Valid, unique NIC
+            return False 
+        if DATA_DELIMITER in nic or LIST_DELIMITER in nic:
+            print(f"Error: NIC cannot contain reserved characters ('{DATA_DELIMITER}', '{LIST_DELIMITER}'). Please try again.")
+            continue
+        break 
 
     name = input(f"Enter {role}'s full name: ").strip()
+    if DATA_DELIMITER in name or LIST_DELIMITER in name:
+        print(f"Warning: Name contains reserved characters ('{DATA_DELIMITER}', '{LIST_DELIMITER}'). Please avoid them for data integrity.")
     if not name:
         print("Warning: Name has been left blank.")
 
     address = input(f"Enter {role}'s address: ").strip()
+    if DATA_DELIMITER in address or LIST_DELIMITER in address:
+         print(f"Warning: Address contains reserved characters ('{DATA_DELIMITER}', '{LIST_DELIMITER}'). Please avoid them for data integrity.")
     if not address:
         print("Warning: Address has been left blank.")
 
@@ -222,20 +392,16 @@ def register_user(role='customer'):
         "role": role
     }
     if role == 'customer':
-        user_data["owned_accounts"] = [] # Customers start with no bank accounts
+        user_data["owned_accounts"] = [] 
 
     users[nic] = user_data
     print("-" * 30)
     print(f"{role.capitalize()} user '{nic}' ({name}) registered successfully!")
     print("-" * 30)
-    # Data saving is typically handled by the calling function (e.g., after main menu choice)
-    return True # Indicate success
+    return True 
 
 def login_user():
-    """Handles user login.
-    Returns:
-        tuple: (nic, user_data_dict) if successful, else None.
-    """
+    """Handles user login."""
     print("\n--- User Login ---")
     nic = input("Enter your NIC: ").strip()
     if nic not in users:
@@ -244,12 +410,11 @@ def login_user():
 
     user_data = users[nic]
 
-    # Give user a few attempts for the password
-    for attempt in range(3, 0, -1): # 3, 2, 1
+    for attempt in range(3, 0, -1): 
         password = getpass.getpass(f"Enter password for {nic}: ")
         if verify_password(user_data["password_hash"], password):
             print(f"\nLogin successful. Welcome, {user_data['name']} ({user_data['role'].capitalize()})!")
-            return nic, user_data # Return NIC along with data for convenience
+            return nic, user_data 
         else:
             print(f"Incorrect password. {attempt - 1} attempts remaining.")
 
@@ -261,7 +426,6 @@ def login_user():
 def create_customer_bank_account(customer_nic):
     """Creates a new bank account for the given customer NIC."""
     print("\n--- Create New Bank Account ---")
-    # Customer data should already be validated by login, but good to have defensive checks
     customer_data = users.get(customer_nic)
     if not customer_data or customer_data['role'] != 'customer':
         print("Error: Invalid customer profile for account creation. This shouldn't happen.")
@@ -271,14 +435,14 @@ def create_customer_bank_account(customer_nic):
     while True:
         try:
             amount_str = input(f"Enter initial deposit amount (min {format_currency(MIN_INITIAL_DEPOSIT)}): ").strip()
-            if not amount_str and MIN_INITIAL_DEPOSIT == 0.0: # Allow empty for 0 if min is 0
+            if not amount_str and MIN_INITIAL_DEPOSIT == 0.0: 
                 initial_deposit = 0.0
                 break
             initial_deposit = float(amount_str)
             if initial_deposit < MIN_INITIAL_DEPOSIT:
                 print(f"Initial deposit must be at least {format_currency(MIN_INITIAL_DEPOSIT)}.")
             else:
-                break # Valid amount
+                break 
         except ValueError:
             print("Invalid amount. Please enter a number (e.g., 50.00).")
 
@@ -286,14 +450,14 @@ def create_customer_bank_account(customer_nic):
     accounts[acc_num] = {
         "owner_nic": customer_nic,
         "balance": initial_deposit,
-        "transactions": [], # Fresh account, fresh transactions
+        "transactions": [], 
         "created_at": get_timestamp()
     }
 
     if initial_deposit > 0:
         record_transaction(acc_num, "Initial Deposit", initial_deposit)
 
-    customer_data["owned_accounts"].append(acc_num) # Link account to customer
+    customer_data.setdefault("owned_accounts", []).append(acc_num) 
 
     print("-" * 30)
     print("Bank account created successfully!")
@@ -305,7 +469,7 @@ def create_customer_bank_account(customer_nic):
 
 def choose_customer_account(customer_nic, action_verb="perform an action on"):
     """Lets a customer choose one of their accounts."""
-    customer_data = users.get(customer_nic) # Should always exist if customer is logged in
+    customer_data = users.get(customer_nic) 
     owned_accounts = customer_data.get("owned_accounts", [])
 
     if not owned_accounts:
@@ -318,7 +482,7 @@ def choose_customer_account(customer_nic, action_verb="perform an action on"):
 
     print(f"\nSelect account to {action_verb}:")
     for i, acc_num in enumerate(owned_accounts):
-        balance = accounts.get(acc_num, {}).get('balance', 0.0) # Safely get balance
+        balance = accounts.get(acc_num, {}).get('balance', 0.0) 
         print(f"  {i + 1}. Account {acc_num} (Balance: {format_currency(balance)})")
 
     while True:
@@ -337,9 +501,9 @@ def make_deposit(customer_nic):
     print("\n--- Deposit Funds ---")
     acc_num = choose_customer_account(customer_nic, "deposit into")
     if not acc_num:
-        return # No account selected or no accounts exist
+        return 
 
-    account = accounts.get(acc_num) # Should exist if choose_customer_account returned it
+    account = accounts.get(acc_num) 
     if not account:
          print(f"Internal Error: Account {acc_num} data not found. Please contact support.")
          return
@@ -413,9 +577,6 @@ def display_balance(customer_nic):
          return
 
     print("-" * 30)
-    # We have customer_nic, so we can look up the name if desired:
-    # owner_name = users.get(account['owner_nic'], {}).get('name', 'Unknown')
-    # print(f"Account Holder: {owner_name} (NIC: {account['owner_nic']})")
     print(f"Account Holder NIC: {account['owner_nic']}")
     print(f"Account Number: {acc_num}")
     print(f"Current Balance: {format_currency(account['balance'])}")
@@ -433,7 +594,7 @@ def display_transaction_history(customer_nic):
          print(f"Internal Error: Account {acc_num} data not found. Please contact support.")
          return
 
-    print("-" * 75) # Adjusted width for potentially longer details
+    print("-" * 75) 
     print(f"Transaction History for Account: {acc_num} (Owner NIC: {account['owner_nic']})")
     print("-" * 75)
 
@@ -441,18 +602,16 @@ def display_transaction_history(customer_nic):
     if not transactions:
         print("No transactions found for this account.")
     else:
-        # Header for the transaction table
         print(f"{'Timestamp':<20} | {'Type':<18} | {'Amount':<15} | Details")
         print("-" * 75)
         for tx in transactions:
-            details_parts = [] # Build a list of detail strings
+            details_parts = [] 
             if tx["type"] == "Transfer Sent":
                  details_parts.append(f"To Acct: {tx.get('to_account', 'N/A')}")
             elif tx["type"] == "Transfer Received":
                  details_parts.append(f"From Acct: {tx.get('from_account', 'N/A')}")
             elif tx["type"] == "Interest Applied":
-                 details_parts.append(f"Rate: {INTEREST_RATE*100:.2f}% p.a.")
-            # Add more custom details for other transaction types if needed
+                 details_parts.append(f"Rate: {tx.get('rate', INTEREST_RATE)*100:.2f}% p.a.")
             details_str = ", ".join(details_parts) if details_parts else "N/A"
             print(f"{tx['timestamp']:<20} | {tx['type']:<18} | {format_currency(tx['amount']):<15} | {details_str}")
     print("-" * 75)
@@ -466,7 +625,7 @@ def transfer_funds(customer_nic):
         return
 
     source_account = accounts.get(source_acc_num)
-    if not source_account: # Should not happen if choose_customer_account worked
+    if not source_account: 
          print(f"Internal Error: Source account {source_acc_num} not found. Please contact support.")
          return
 
@@ -483,7 +642,6 @@ def transfer_funds(customer_nic):
         print(f"Error: Recipient account '{dest_acc_num}' does not exist.")
         return
 
-    # Get transfer amount
     while True:
         try:
             amount_str = input(f"Enter amount to transfer (from {source_acc_num}): ").strip()
@@ -501,11 +659,9 @@ def transfer_funds(customer_nic):
         print(f"  Requested for transfer: {format_currency(amount)}")
         return
 
-    # Perform the transfer
     source_account["balance"] -= amount
     dest_account["balance"] += amount
 
-    # Record transactions for both accounts
     record_transaction(source_acc_num, "Transfer Sent", amount, to_account=dest_acc_num)
     record_transaction(dest_acc_num, "Transfer Received", amount, from_account=source_acc_num)
 
@@ -523,11 +679,10 @@ def view_all_users():
         print("No users are currently registered in the system.")
         return
 
-    print("-" * 70) # Adjusted width
+    print("-" * 70) 
     print(f"{'NIC':<15} | {'Name':<20} | {'Role':<10} | {'Owned Accounts'}")
     print("-" * 70)
     for nic, data in users.items():
-        # For customers, show their account numbers; for admins, 'N/A'
         owned_acc_str = ", ".join(data.get('owned_accounts', [])) if data['role'] == 'customer' else 'N/A'
         if not owned_acc_str and data['role'] == 'customer': owned_acc_str = "None"
         print(f"{nic:<15} | {data.get('name', 'N/A'):<20} | {data.get('role', 'N/A').capitalize():<10} | {owned_acc_str}")
@@ -540,7 +695,7 @@ def view_all_bank_accounts():
         print("No bank accounts currently exist in the system.")
         return
 
-    print("-" * 75) # Adjusted width
+    print("-" * 75) 
     print(f"{'Account No.':<12} | {'Owner NIC':<15} | {'Owner Name':<20} | {'Balance':<15} | {'Created At'}")
     print("-" * 75)
     for acc_num, data in accounts.items():
@@ -565,13 +720,11 @@ def apply_interest_to_all_accounts():
 
     for acc_num, account_data in accounts.items():
         current_balance = account_data.get("balance", 0.0)
-        if current_balance > 0: # Only apply interest to positive balances
-            interest_earned = round(current_balance * INTEREST_RATE, 2) # Calculate and round
-            if interest_earned > 0: # Only proceed if interest is meaningful
+        if current_balance > 0: 
+            interest_earned = round(current_balance * INTEREST_RATE, 2) 
+            if interest_earned > 0: 
                 account_data["balance"] += interest_earned
                 record_transaction(acc_num, "Interest Applied", interest_earned, rate=INTEREST_RATE)
-                # Optional: print individual application details (can be noisy for many accounts)
-                # print(f"  Applied {format_currency(interest_earned)} to Acc {acc_num}. New balance: {format_currency(account_data['balance'])}")
                 applied_count += 1
                 total_interest_applied += interest_earned
 
@@ -590,7 +743,6 @@ def show_login_menu():
     print("\n===== Welcome to Simple Bank App =====")
     print("1. Login")
     print("2. Register New Customer")
-    # Admin registration is typically handled at first run or by another admin.
     print("3. Exit Application")
     print("====================================")
 
@@ -612,9 +764,6 @@ def show_admin_menu(admin_name):
     print("1. View All Users")
     print("2. View All Bank Accounts")
     print("3. Apply Annual Interest to All Accounts")
-    # Future admin functions could be:
-    # print("X. Manage Users (Lock/Unlock, Delete)")
-    # print("Y. Manage Accounts (Freeze, Close)")
     print("4. Logout")
     print("==================================")
 
@@ -639,15 +788,14 @@ def run_customer_session(customer_nic, customer_data):
             transfer_funds(customer_nic)
         elif choice == '7':
             print(f"\nLogging out, {customer_name}. Have a great day!")
-            break # Exit customer session loop
+            break 
         else:
             print("Invalid choice. Please select an option from the menu.")
 
         input("\nPress Enter to return to the customer menu...")
-        # For a cleaner interface, you might uncomment this on some systems:
         # os.system('cls' if os.name == 'nt' else 'clear')
 
-def run_admin_session(admin_nic, admin_data): # admin_nic might be useful later
+def run_admin_session(admin_nic, admin_data): 
     """Handles the interactive session for a logged-in admin."""
     admin_name = admin_data['name']
     while True:
@@ -662,7 +810,7 @@ def run_admin_session(admin_nic, admin_data): # admin_nic might be useful later
             apply_interest_to_all_accounts()
         elif choice == '4':
             print(f"\nLogging out, Admin {admin_name}.")
-            break # Exit admin session loop
+            break 
         else:
             print("Invalid choice. Please select an option from the menu.")
 
@@ -672,45 +820,40 @@ def run_admin_session(admin_nic, admin_data): # admin_nic might be useful later
 
 def run_app():
     """Main function to run the banking application."""
-    load_data() # Load existing data or set up first admin if necessary
+    load_data() 
 
     while True:
         show_login_menu()
         choice = input("Choose an option (1-3): ").strip()
 
-        if choice == '1': # Login
+        if choice == '1': 
             login_result = login_user()
             if login_result:
-                nic, user_data = login_result # Unpack NIC and user data
+                nic, user_data = login_result 
                 if user_data['role'] == 'admin':
                     run_admin_session(nic, user_data)
                 elif user_data['role'] == 'customer':
                     run_customer_session(nic, user_data)
                 else:
-                    # This case should ideally not be reached if data is consistent
                     print(f"Error: Unknown user role '{user_data['role']}' for user {nic}.")
-                # After logout from either session, loop continues to show login menu
             else:
-                # Failed login, login_user() already printed a message
                 input("\nPress Enter to return to the main menu...")
 
-        elif choice == '2': # Register New Customer
+        elif choice == '2': 
             if register_user(role='customer'):
-                 save_data() # Save new customer registration
+                 save_data() 
                  print("Registration successful. You can now log in.")
-            # If registration fails, register_user() prints messages
             input("\nPress Enter to return to the main menu...")
 
-        elif choice == '3': # Exit
+        elif choice == '3': 
             print("\nExiting the Banking Application...")
-            save_data() # Ensure all latest changes are saved before exiting
+            save_data() 
             print("Goodbye!")
-            break # Exit the main application loop
+            break 
         else:
             print("Invalid choice. Please enter a number between 1 and 3.")
             input("\nPress Enter to continue...")
-
-        # os.system('cls' if os.name == 'nt' else 'clear') # Optional: Clear screen
+        # os.system('cls' if os.name == 'nt' else 'clear')
 
 # --- Application Start ---
 if __name__ == "__main__":
